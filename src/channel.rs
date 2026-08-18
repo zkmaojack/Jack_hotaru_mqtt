@@ -11,7 +11,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use hotaru_core::connection::{ConnMeta, ConnStream};
 use hotaru_core::protocol::{Channel, ProtocolRole};
@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::codec::{write_packet, write_publish_packet};
 use crate::error::MqttError;
-use crate::packet::{Packet, PublishPacket};
+use crate::packet::{Packet, ProtocolVersion, PublishPacket};
 use crate::session::MqttSession;
 
 // ----------------------------------------------------------------------------
@@ -29,7 +29,7 @@ use crate::session::MqttSession;
 
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub fn next_connection_id() -> u64 {
+pub(crate) fn next_connection_id() -> u64 {
     CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -67,6 +67,9 @@ pub struct MqttChannel<W: ConnStream> {
     // ── Logical session (may outlive channel under clean_session=false) ──
     session: Arc<MqttSession>,
 
+    // ── Version negotiated by CONNECT ───────────────────────────
+    version: Arc<AtomicU8>,
+
     // ── Lifecycle signals ───────────────────────────────────────
     open: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
@@ -82,6 +85,7 @@ impl<W: ConnStream> Clone for MqttChannel<W> {
             local_addr: self.local_addr,
             remote_addr: self.remote_addr,
             session: self.session.clone(),
+            version: self.version.clone(),
             open: self.open.clone(),
             shutdown: self.shutdown.clone(),
         }
@@ -119,6 +123,7 @@ impl<W: ConnStream> MqttChannel<W> {
         let open = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(Notify::new());
         let session = MqttSession::new();
+        let version = Arc::new(AtomicU8::new(ProtocolVersion::default().level()));
 
         // Spawn the writer actor — single owner of W::WriteHalf.
         tokio::spawn(writer_actor::<W>(
@@ -126,6 +131,7 @@ impl<W: ConnStream> MqttChannel<W> {
             cmd_rx,
             shutdown.clone(),
             open.clone(),
+            version.clone(),
         ));
 
         Self {
@@ -136,6 +142,7 @@ impl<W: ConnStream> MqttChannel<W> {
             local_addr: meta.local_addr(),
             remote_addr: meta.remote_addr(),
             session,
+            version,
             open,
             shutdown,
         }
@@ -151,6 +158,16 @@ impl<W: ConnStream> MqttChannel<W> {
 
     pub fn session(&self) -> &Arc<MqttSession> {
         &self.session
+    }
+
+    /// Fix the wire version for this connection after the CONNECT handshake.
+    pub fn set_protocol_version(&self, version: ProtocolVersion) {
+        self.version.store(version.level(), Ordering::Release);
+    }
+
+    /// Return the wire version negotiated for this connection.
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        ProtocolVersion::from_level(self.version.load(Ordering::Acquire)).unwrap_or_default()
     }
 
     pub fn connection_id(&self) -> u64 {
@@ -170,11 +187,11 @@ impl<W: ConnStream> MqttChannel<W> {
     }
 
     pub fn client_id(&self) -> Option<Arc<str>> {
-        self.session.bind.client_id()
+        self.session.bind().client_id()
     }
 
     pub fn keep_alive(&self) -> Option<u16> {
-        self.session.bind.keep_alive()
+        self.session.bind().keep_alive()
     }
 
     /// Send a control packet through the writer actor. Returns
@@ -208,16 +225,21 @@ async fn writer_actor<W: ConnStream>(
     mut cmd_rx: mpsc::UnboundedReceiver<WriteCmd>,
     shutdown: Arc<Notify>,
     open: Arc<AtomicBool>,
+    version: Arc<AtomicU8>,
 ) {
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(WriteCmd::Packet(p)) => {
-                        if write_packet(&mut writer, &p).await.is_err() { break; }
+                        let version = ProtocolVersion::from_level(version.load(Ordering::Acquire))
+                            .unwrap_or_default();
+                        if write_packet(&mut writer, &p, version).await.is_err() { break; }
                     }
                     Some(WriteCmd::Publish(p)) => {
-                        if write_publish_packet(&mut writer, &p).await.is_err() { break; }
+                        let version = ProtocolVersion::from_level(version.load(Ordering::Acquire))
+                            .unwrap_or_default();
+                        if write_publish_packet(&mut writer, &p, version).await.is_err() { break; }
                     }
                     Some(WriteCmd::Flush) => {
                         let _ = writer.flush().await;  // W policy §1: shutdown-ish path
@@ -230,5 +252,5 @@ async fn writer_actor<W: ConnStream>(
     }
     // Mark channel closed (idempotent with Channel::close).
     open.store(false, Ordering::Release);
-    let _ = writer.shutdown().await;   // W policy §1: shutdown path
+    let _ = writer.shutdown().await; // W policy §1: shutdown path
 }

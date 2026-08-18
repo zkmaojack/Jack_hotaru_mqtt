@@ -50,8 +50,9 @@ pub struct MqttSession {
     /// Outbound packet-id counter. Wraps at u16::MAX; allocation logic skips
     /// 0 and (future) checks inflight set for collisions.
     pub pkt_counter: AtomicU16,
-    /// One-time bind: written once on CONNACK completion.
-    pub bind: OnceLockBindInfo,
+    /// One-time bind: written once on CONNACK completion. Private so the
+    /// one-shot discipline stays enforceable; reach it through `bind()`.
+    bind: OnceLockBindInfo,
     /// Inbound QoS 2 half-state: keyed by peer-allocated packet-id, holds
     /// the PUBLISH awaiting PUBREL.
     pub qos2_recv: DashMap<u16, IncomingPublish>,
@@ -74,13 +75,21 @@ impl MqttSession {
         })
     }
 
+    /// The one-time bind slot, written on CONNACK completion.
+    pub fn bind(&self) -> &OnceLockBindInfo {
+        &self.bind
+    }
+
     /// Allocate the next outbound packet-id. Skips 0 (reserved per spec).
     /// Does not check for collisions with existing inflight — collisions are
     /// statistically rare with u16 space and 5-deep typical inflight; on
     /// collision the caller may observe ack misrouting which surfaces as
     /// `AckTimeout`. Sufficient for MVP; tighter alloc is a J-phase concern.
     pub fn allocate_packet_id(&self) -> u16 {
-        let id = self.pkt_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let id = self
+            .pkt_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         if id == 0 { 1 } else { id }
     }
 

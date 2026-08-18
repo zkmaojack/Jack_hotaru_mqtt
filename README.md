@@ -4,15 +4,16 @@
 [![Docs.rs](https://docs.rs/hotaru_mqtt/badge.svg)](https://docs.rs/hotaru_mqtt)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
-MQTT 3.1.1 broker and client for the [Hotaru](https://github.com/hotaru/hotaru) framework.
+MQTT 3.1.1 broker and client with in-progress MQTT 5 support for the [Hotaru](https://github.com/hotaru/hotaru) framework.
 
-`hotaru_mqtt` plugs into `hotaru_core`'s protocol/runtime model and gives you both sides of an MQTT 3.1.1 deployment in one crate: a server-side `Broker` for cross-connection fanout, and a client session driven by `MqttClientConfig`. Wire framing, session state, topic matching, and QoS 0/1/2 flows are all handled internally.
+`hotaru_mqtt` plugs into `hotaru_core`'s protocol/runtime model and gives you both sides of an MQTT deployment in one crate: a server-side `Broker` for cross-connection fanout, and a client session driven by `MqttClientConfig`. Wire framing, session state, topic matching, and QoS 0/1/2 flows are all handled internally. MQTT 3.1.1 remains the default; MQTT 5 wire framing is selected per connection by the CONNECT handshake.
 
 > **Status:** pre-1.0 (currently `0.8.2`). The crate tracks the `hotaru_core` release cadence and the public API may shift between minor versions.
 
 ## Features
 
 - MQTT 3.1.1 wire codec (CONNECT, PUBLISH, SUBSCRIBE, UNSUBSCRIBE, PINGREQ, DISCONNECT and their acks).
+- MQTT 5 phase-one wire framing and properties, negotiated independently for each connection.
 - Broker with hand-rolled topic-filter matching and per-subscriber fanout via `MqttChannel`.
 - Pluggable authentication through the `Authenticator` trait (`AcceptAllAuthenticator` by default).
 - Client session with clean-session toggle, keep-alive, last-will, credentials, and initial subscriptions.
@@ -78,10 +79,11 @@ A client session is configured with `MqttClientConfig`, registered into runtime 
 ```rust
 use std::sync::Arc;
 use hotaru_mqtt::{
-    CLIENT_CONFIG_STATICS_KEY, MQTT, MqttClientConfig, QoS,
+    CLIENT_CONFIG_STATICS_KEY, MQTT, MqttClientConfig, ProtocolVersion, QoS,
 };
 
 let config = MqttClientConfig::new("device-42")
+    .protocol_version(ProtocolVersion::V5)
     .clean_session(true)
     .keep_alive(60)
     .with_credentials("user", "secret")
@@ -100,14 +102,18 @@ End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), whic
 cargo test
 ```
 
-## Module layout
+## Internal layout
+
+These are internal modules, not addressable paths. Everything supported is
+re-exported at the crate root; `codec` is the one module you can name, for
+low-level wire encode/decode.
 
 | Module      | Responsibility                                                   |
 | ----------- | ---------------------------------------------------------------- |
 | `broker`    | Server-side fanout, subscriber registry, `Authenticator` hook.   |
 | `client`    | `MqttClientConfig` builder for client-session startup.           |
 | `protocol`  | `MqttProtocol`, `MQTT::server()` / `MQTT::client()` entry points.|
-| `codec`     | MQTT 3.1.1 wire encode / decode.                                 |
+| `codec`     | Version-aware MQTT 3.1.1 / MQTT 5 wire encode and decode.        |
 | `packet`    | Strongly-typed CONNECT / PUBLISH / SUBSCRIBE / … packet structs. |
 | `channel`   | `MqttChannel<W>` + `WriteCmd` for the per-connection write loop. |
 | `context`   | `MqttContext` carried through request handling.                  |
@@ -115,7 +121,9 @@ cargo test
 | `session`   | `MqttSession`, packet-id tracking, `AckSlot`.                    |
 | `topic`     | Topic / filter parsing and validation.                           |
 | `error`     | `MqttError`, `CodecError`, `Violation`, `TimeoutKind`.           |
-| `transport` | Transport trait glue for `hotaru_core::connection`.              |
+
+Custom transports are supplied through the protocol's type parameters,
+`MqttProtocol<W, TS>`, rather than through a dedicated module.
 
 ## License
 

@@ -28,12 +28,11 @@ use crate::codec::read_packet;
 use crate::context::MqttContext;
 use crate::error::{MqttError, TimeoutKind, Violation};
 use crate::packet::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket,
-    SubscribePacket, TopicSubscription, UnsubscribePacket, WillPacket,
+    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket,
+    SubackPacket, SubscribePacket, TopicSubscription, UnsubackPacket, UnsubscribePacket,
+    WillPacket,
 };
-use crate::request::{
-    MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter,
-};
+use crate::request::{MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter};
 use crate::session::{AckSlot, BindInfo};
 
 // ----------------------------------------------------------------------------
@@ -173,14 +172,10 @@ where
         _outbound: Arc<<Self::TS as TransportSpec>::Outbound>,
     ) -> Result<Self::Channel, CtxError<Self>> {
         let slot = self.session_channel.as_ref().ok_or_else(|| {
-            MqttError::Configuration(
-                "acquire_channel called on Server-mode MqttProtocol".into(),
-            )
+            MqttError::Configuration("acquire_channel called on Server-mode MqttProtocol".into())
         })?;
         let channel = slot.get().ok_or_else(|| {
-            MqttError::NotConnected(
-                "call client.run_wire(wire) to establish session first".into(),
-            )
+            MqttError::NotConnected("call client.run_wire(wire) to establish session first".into())
         })?;
         Ok(channel.clone())
     }
@@ -210,9 +205,7 @@ where
     let config = runtime
         .get_static::<Arc<MqttClientConfig>>(CLIENT_CONFIG_STATICS_KEY)
         .ok_or_else(|| {
-            MqttError::Configuration(
-                "MqttClientConfig not registered in runtime statics".into(),
-            )
+            MqttError::Configuration("MqttClientConfig not registered in runtime statics".into())
         })?;
 
     // 1. Take exclusive reader ownership (single-take).
@@ -223,12 +216,16 @@ where
 
     // 2. Send CONNECT
     let connect = build_connect(&config);
-    channel.send_packet(Packet::Connect(connect))?;
+    channel.set_protocol_version(connect.version);
+    channel.send_packet(Packet::Connect(Box::new(connect)))?;
 
     // 3. Wait for CONNACK with timeout
-    let connack_packet = timeout(config.connect_timeout, read_packet(&mut reader))
-        .await
-        .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
+    let connack_packet = timeout(
+        config.connect_timeout,
+        read_packet(&mut reader, config.protocol_version),
+    )
+    .await
+    .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
     let Packet::Connack(ack) = connack_packet else {
         return Err(Violation::ExpectedConnack.into());
     };
@@ -237,7 +234,7 @@ where
     }
 
     // Bind session.
-    let _ = channel.session().bind.set(BindInfo {
+    let _ = channel.session().bind().set(BindInfo {
         client_id: config.client_id.clone(),
         keep_alive: config.keep_alive_secs,
     });
@@ -280,7 +277,7 @@ where
             break;
         }
         tokio::select! {
-            inbound = read_packet(&mut reader) => {
+            inbound = read_packet(&mut reader, channel.protocol_version()) => {
                 match inbound {
                     Ok(p) => {
                         if dispatch_client_inbound(channel.clone(), p, runtime.clone(), root.clone(), &config).await? {
@@ -326,7 +323,14 @@ where
             if publish.qos == QoS::ExactlyOnce {
                 return Ok(false);
             }
-            dispatch_inbound_to_endpoints(channel, &publish, runtime, root, config.default_inbound.as_ref()).await;
+            dispatch_inbound_to_endpoints(
+                channel,
+                &publish,
+                runtime,
+                root,
+                config.default_inbound.as_ref(),
+            )
+            .await;
             Ok(false)
         }
         Packet::Puback(id) => {
@@ -348,7 +352,14 @@ where
         Packet::Pubrel(id) => {
             // Inbound QoS 2: take stored qos2_recv and dispatch
             if let Some((_, publish)) = channel.session().qos2_recv.remove(&id) {
-                dispatch_incoming_to_endpoints_owned(channel.clone(), publish, runtime, root, config.default_inbound.as_ref()).await;
+                dispatch_incoming_to_endpoints_owned(
+                    channel.clone(),
+                    publish,
+                    runtime,
+                    root,
+                    config.default_inbound.as_ref(),
+                )
+                .await;
             }
             channel.send_packet(Packet::Pubcomp(id))?;
             Ok(false)
@@ -357,8 +368,8 @@ where
             fire_suback(&channel, s);
             Ok(false)
         }
-        Packet::Unsuback(id) => {
-            fire_unsuback(&channel, id);
+        Packet::Unsuback(packet) => {
+            fire_unsuback(&channel, packet.packet_id);
             Ok(false)
         }
         Packet::Pingresp => Ok(false),
@@ -390,17 +401,22 @@ where
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
     // 1. Read CONNECT with timeout
-    let connect_packet = timeout(CONNECT_RECEIVE_TIMEOUT, read_packet(&mut reader))
-        .await
-        .map_err(|_| MqttError::Timeout(TimeoutKind::ConnectReceive))??;
+    let connect_packet = timeout(
+        CONNECT_RECEIVE_TIMEOUT,
+        read_packet(&mut reader, ProtocolVersion::default()),
+    )
+    .await
+    .map_err(|_| MqttError::Timeout(TimeoutKind::ConnectReceive))??;
     let Packet::Connect(connect) = connect_packet else {
         return Err(Violation::ExpectedConnect.into());
     };
+    channel.set_protocol_version(connect.version);
 
     // 2. Authenticate
     let auth = broker.authenticate(&connect, channel.remote_addr()).await;
     if !auth.accepted {
         let _ = channel.send_packet(Packet::Connack(ConnackPacket {
+            properties: Default::default(),
             session_present: false,
             return_code: auth.return_code,
         }));
@@ -429,13 +445,14 @@ where
         .register_session(client_id.clone(), channel.clone(), will, clean_session)
         .await;
 
-    let _ = channel.session().bind.set(BindInfo {
+    let _ = channel.session().bind().set(BindInfo {
         client_id: client_id.clone(),
         keep_alive,
     });
 
     // 4. Send CONNACK
     channel.send_packet(Packet::Connack(ConnackPacket {
+        properties: Default::default(),
         session_present,
         return_code: ConnackReturnCode::Accepted,
     }))?;
@@ -451,7 +468,10 @@ where
             break;
         }
         tokio::select! {
-            packet = timeout(read_timeout, read_packet(&mut reader)) => {
+            packet = timeout(
+                read_timeout,
+                read_packet(&mut reader, channel.protocol_version()),
+            ) => {
                 match packet {
                     Err(_) => break,                              // keep-alive timeout = crash
                     Ok(Err(MqttError::Io(_))) => break,           // wire closed = crash
@@ -532,7 +552,10 @@ where
         }
         Packet::Unsubscribe(u) => {
             broker.unsubscribe(client_id, &u.topics).await;
-            channel.send_packet(Packet::Unsuback(u.packet_id))?;
+            channel.send_packet(Packet::Unsuback(UnsubackPacket {
+                packet_id: u.packet_id,
+                reason_codes: vec![0x00; u.topics.len()],
+            }))?;
             Ok(())
         }
         Packet::Pingreq => {
@@ -557,6 +580,7 @@ where
             if let Some((_, stored)) = channel.session().qos2_recv.remove(&id) {
                 // Re-build into a wire PublishPacket to run chain + fanout
                 let publish = PublishPacket {
+                    properties: stored.properties.clone(),
                     topic: stored.topic.clone(),
                     payload: stored.payload.clone(),
                     dup: false,
@@ -648,9 +672,7 @@ async fn dispatch_inbound_to_endpoints<W, TS>(
         });
     }
 
-    if !matched
-        && let Some(handler) = default_handler
-    {
+    if !matched && let Some(handler) = default_handler {
         // Fallback inbound handler (MqttClientConfig.default_inbound)
         let handler = handler.clone();
         let inc = incoming_from_packet(publish);
@@ -731,6 +753,7 @@ where
                 }
                 // If chain mutated the incoming, propagate it back to the wire packet
                 if let Some(inc) = out.incoming {
+                    current.properties = inc.properties;
                     current.topic = inc.topic;
                     current.payload = inc.payload;
                     current.qos = inc.qos;
@@ -754,10 +777,9 @@ async fn send_impl<TS>(mut ctx: MqttContext<TS>) -> Result<MqttContext<TS>, Mqtt
 where
     TS: TransportSpec,
 {
-    let channel = ctx
-        .channel()
-        .cloned()
-        .ok_or(MqttError::NotConnected("no channel installed in ctx".into()))?;
+    let channel = ctx.channel().cloned().ok_or(MqttError::NotConnected(
+        "no channel installed in ctx".into(),
+    ))?;
 
     let request = std::mem::replace(
         &mut ctx.request,
@@ -785,6 +807,7 @@ async fn send_publish<W: ConnStream>(
     };
 
     let packet = PublishPacket {
+        properties: Default::default(),
         topic: req.topic,
         payload: req.payload,
         dup: false,
@@ -892,10 +915,7 @@ async fn send_unsubscribe<W: ConnStream>(
         .session()
         .pending_acks
         .insert(packet_id, AckSlot::Unsuback(tx));
-    channel.send_packet(Packet::Unsubscribe(UnsubscribePacket {
-        packet_id,
-        topics,
-    }))?;
+    channel.send_packet(Packet::Unsubscribe(UnsubscribePacket { packet_id, topics }))?;
     timeout(DEFAULT_ACK_TIMEOUT, rx)
         .await
         .map_err(|_| {
@@ -936,22 +956,15 @@ fn fire_ack<W: ConnStream>(channel: &MqttChannel<W>, id: u16, kind: AckKind) {
 }
 
 fn fire_suback<W: ConnStream>(channel: &MqttChannel<W>, packet: SubackPacket) {
-    if let Some((_, slot)) = channel
-        .session()
-        .pending_acks
-        .remove(&packet.packet_id)
+    if let Some((_, AckSlot::Suback(tx))) = channel.session().pending_acks.remove(&packet.packet_id)
     {
-        if let AckSlot::Suback(tx) = slot {
-            let _ = tx.send(packet.return_codes);
-        }
+        let _ = tx.send(packet.return_codes);
     }
 }
 
 fn fire_unsuback<W: ConnStream>(channel: &MqttChannel<W>, id: u16) {
-    if let Some((_, slot)) = channel.session().pending_acks.remove(&id) {
-        if let AckSlot::Unsuback(tx) = slot {
-            let _ = tx.send(());
-        }
+    if let Some((_, AckSlot::Unsuback(tx))) = channel.session().pending_acks.remove(&id) {
+        let _ = tx.send(());
     }
 }
 
@@ -961,12 +974,15 @@ fn fire_unsuback<W: ConnStream>(channel: &MqttChannel<W>, id: u16) {
 
 fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
     ConnectPacket {
+        version: config.protocol_version,
+        properties: Default::default(),
         client_id: config.client_id.clone(),
         clean_session: config.clean_session,
         keep_alive: config.keep_alive_secs,
         username: config.credentials.as_ref().map(|c| c.username.clone()),
         password: config.credentials.as_ref().map(|c| c.password.clone()),
         will: config.will.as_ref().map(|w| WillPacket {
+            properties: Default::default(),
             topic: w.topic.clone(),
             payload: w.payload.clone(),
             qos: w.qos,

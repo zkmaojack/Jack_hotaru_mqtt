@@ -1,4 +1,4 @@
-//! MQTT 3.1.1 wire packet types.
+//! MQTT 3.1.1 and MQTT 5 wire packet types.
 //!
 //! All payload bytes use `Bytes` (Arc-backed) and topics use `Arc<str>` so
 //! that fanout to N subscribers costs N Arc-clones, no `memcpy`.
@@ -6,20 +6,17 @@
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
-use std::error::Error;
 use std::sync::Arc;
 
 use bitflags::bitflags;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
-use hotaru_core::protocol::Message;
-
-use crate::codec::{decode_packet_from_bytes, encode_packet};
+use crate::properties::Properties;
 use crate::request::{PacketId, QoS, SubackCode};
 
 #[derive(Debug, Clone)]
 pub enum Packet {
-    Connect(ConnectPacket),
+    Connect(Box<ConnectPacket>),
     Connack(ConnackPacket),
     Publish(PublishPacket),
     Puback(PacketId),
@@ -29,7 +26,7 @@ pub enum Packet {
     Subscribe(SubscribePacket),
     Suback(SubackPacket),
     Unsubscribe(UnsubscribePacket),
-    Unsuback(PacketId),
+    Unsuback(UnsubackPacket),
     Pingreq,
     Pingresp,
     Disconnect,
@@ -59,6 +56,8 @@ impl Packet {
 
 #[derive(Debug, Clone)]
 pub struct PublishPacket {
+    /// MQTT 5 properties. Ignored on MQTT 3.1.1 connections.
+    pub properties: Properties,
     pub topic: Arc<str>,
     pub payload: Bytes,
     pub dup: bool,
@@ -77,6 +76,10 @@ impl PublishPacket {
 
 #[derive(Debug, Clone)]
 pub struct ConnectPacket {
+    /// The wire version advertised by this self-describing CONNECT packet.
+    pub version: ProtocolVersion,
+    /// MQTT 5 CONNECT properties. Ignored for MQTT 3.1.1.
+    pub properties: Properties,
     pub client_id: Arc<str>,
     pub clean_session: bool,
     pub keep_alive: u16,
@@ -87,6 +90,8 @@ pub struct ConnectPacket {
 
 #[derive(Debug, Clone)]
 pub struct WillPacket {
+    /// MQTT 5 Will properties. Ignored for MQTT 3.1.1.
+    pub properties: Properties,
     pub topic: Arc<str>,
     pub payload: Bytes,
     pub qos: QoS,
@@ -95,6 +100,8 @@ pub struct WillPacket {
 
 #[derive(Debug, Clone)]
 pub struct ConnackPacket {
+    /// MQTT 5 CONNACK properties. Ignored for MQTT 3.1.1.
+    pub properties: Properties,
     pub session_present: bool,
     pub return_code: ConnackReturnCode,
 }
@@ -123,12 +130,57 @@ pub struct UnsubscribePacket {
     pub topics: Vec<Arc<str>>,
 }
 
+/// Acknowledgement for an UNSUBSCRIBE packet.
+#[derive(Debug, Clone)]
+pub struct UnsubackPacket {
+    pub packet_id: PacketId,
+    /// MQTT 5 reason codes, one for each requested topic filter.
+    /// MQTT 3.1.1 does not put these codes on the wire.
+    pub reason_codes: Vec<u8>,
+}
+
+impl UnsubackPacket {
+    pub fn new(packet_id: PacketId) -> Self {
+        Self {
+            packet_id,
+            reason_codes: Vec::new(),
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Numeric / flag types
 // ----------------------------------------------------------------------------
 
+/// MQTT wire protocol version negotiated by the CONNECT handshake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProtocolVersion {
+    /// MQTT 3.1.1 (CONNECT protocol level 4).
+    #[default]
+    V311,
+    /// MQTT 5.0 (CONNECT protocol level 5).
+    V5,
+}
+
+impl ProtocolVersion {
+    pub const fn level(self) -> u8 {
+        match self {
+            Self::V311 => 4,
+            Self::V5 => 5,
+        }
+    }
+
+    pub const fn from_level(level: u8) -> Option<Self> {
+        match level {
+            4 => Some(Self::V311),
+            5 => Some(Self::V5),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketType {
+pub(crate) enum PacketType {
     Connect = 1,
     Connack = 2,
     Publish = 3,
@@ -171,7 +223,7 @@ impl TryFrom<u8> for PacketType {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct FixedHeaderFlags: u8 {
+    pub(crate) struct FixedHeaderFlags: u8 {
         const Bypass = 0b0000_0000;
         const Retain = 0b0000_0001;
         const QoS = 0b0000_0110;
@@ -181,7 +233,7 @@ bitflags! {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ConnectFlags: u8 {
+    pub(crate) struct ConnectFlags: u8 {
         const Username = 0b1000_0000;
         const Password = 0b0100_0000;
         const WillRetain = 0b0010_0000;
@@ -205,6 +257,29 @@ pub enum ConnackReturnCode {
 impl ConnackReturnCode {
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+
+    pub(crate) fn to_v5_reason(self) -> u8 {
+        match self {
+            Self::Accepted => 0x00,
+            Self::UnacceptableProtocolVersion => 0x84,
+            Self::IdentifierRejected => 0x85,
+            Self::ServerUnavailable => 0x88,
+            Self::BadUsernameOrPassword => 0x86,
+            Self::NotAuthorized => 0x87,
+        }
+    }
+
+    pub(crate) fn from_v5_reason(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::Accepted),
+            0x84 => Some(Self::UnacceptableProtocolVersion),
+            0x85 => Some(Self::IdentifierRejected),
+            0x88 => Some(Self::ServerUnavailable),
+            0x86 => Some(Self::BadUsernameOrPassword),
+            0x87 => Some(Self::NotAuthorized),
+            _ => None,
+        }
     }
 }
 
@@ -234,22 +309,5 @@ impl std::fmt::Display for ConnackReturnCode {
             Self::BadUsernameOrPassword => write!(f, "Bad Username or Password"),
             Self::NotAuthorized => write!(f, "Not Authorized"),
         }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Message impl — connects Packet to hotaru_core's protocol Message trait
-// ----------------------------------------------------------------------------
-
-impl Message for Packet {
-    type BytesMut = BytesMut;
-
-    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        buf.extend_from_slice(&encode_packet(self));
-        Ok(())
-    }
-
-    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        decode_packet_from_bytes(buf)
     }
 }
