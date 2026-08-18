@@ -74,13 +74,21 @@ pub enum CodecError {
     InvalidPacketType(u8),
     MalformedLength,
     InvalidUtf8,
-    PayloadTooLong { len: usize, max: usize },
+    PayloadTooLong {
+        len: usize,
+        max: usize,
+    },
     QosInvalid(u8),
     ReservedFlagSet,
     /// A two-byte-length-prefixed field cannot represent this many bytes.
-    FieldTooLong { kind: &'static str, len: usize },
+    FieldTooLong {
+        kind: &'static str,
+        len: usize,
+    },
     /// MQTT Variable Byte Integers are limited to 268,435,455.
-    VariableByteIntegerOutOfRange { value: usize },
+    VariableByteIntegerOutOfRange {
+        value: usize,
+    },
 }
 
 impl fmt::Display for MqttError {

@@ -86,7 +86,10 @@ impl MqttSession {
     /// collision the caller may observe ack misrouting which surfaces as
     /// `AckTimeout`. Sufficient for MVP; tighter alloc is a J-phase concern.
     pub fn allocate_packet_id(&self) -> u16 {
-        let id = self.pkt_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let id = self
+            .pkt_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         if id == 0 { 1 } else { id }
     }
 
