@@ -17,9 +17,7 @@ use hotaru_core::connection::ConnStream;
 
 use crate::channel::MqttChannel;
 use crate::packet::{ConnackReturnCode, ConnectPacket, PublishPacket};
-use crate::request::{
-    IncomingPublish, PacketId, QoS, SubackCode, TopicFilter, WillMessage,
-};
+use crate::request::{IncomingPublish, PacketId, QoS, SubackCode, TopicFilter, WillMessage};
 
 // ----------------------------------------------------------------------------
 // Authenticator hook
@@ -267,10 +265,9 @@ impl<W: ConnStream> Broker<W> {
         self.inner.subscriptions.remove_client(client_id);
 
         // Non-graceful + will set → publish the will message.
-        if !graceful
-            && let Some(will) = entry.will
-        {
+        if !graceful && let Some(will) = entry.will {
             let will_packet = PublishPacket {
+                properties: Default::default(),
                 topic: will.topic,
                 payload: will.payload,
                 dup: false,
@@ -365,6 +362,7 @@ impl<W: ConnStream> Broker<W> {
 
             // Zero-copy adjustment: topic and payload are Arc/Bytes clones.
             let adjusted = PublishPacket {
+                properties: packet.properties.clone(),
                 topic: packet.topic.clone(),
                 payload: packet.payload.clone(),
                 dup: false,
@@ -403,6 +401,7 @@ impl<W: ConnStream> Broker<W> {
 /// Topic/payload are Arc/Bytes clones (O(1)).
 pub(crate) fn incoming_from_packet(p: &PublishPacket) -> IncomingPublish {
     IncomingPublish {
+        properties: p.properties.clone(),
         topic: p.topic.clone(),
         payload: p.payload.clone(),
         qos: p.qos,
